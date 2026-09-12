@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "job-matcher"
+version = "0.1.0"
+description = "Local, zero-cost job matching: CV PDF -> profile -> remote job feeds -> on-CPU semantic ranking."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "sqlmodel>=0.0.16",
+    "sqlalchemy[asyncio]>=2.0",  # the async engine needs greenlet, which is no longer installed implicitly
+    "aiosqlite>=0.20",
+    "pymupdf>=1.24",
+    "sentence-transformers>=2.7",
+    "numpy>=1.26",
+    "httpx>=0.27",
+    "apscheduler>=3.10,<4",
+    "pydantic-settings>=2.2",
+    "rich>=13.7",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+job-matcher = "app.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-m 'not slow'"
+markers = [
+    "slow: loads the real sentence-transformers model (downloads ~90 MB on first run)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:swigvarlink",
+    "ignore:builtin type Swig.*:DeprecationWarning",
+    # Third-party noise from starlette's TestClient, not from this project.
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+    "ignore:The anyio.abc.BlockingPortal alias is deprecated",
+]
