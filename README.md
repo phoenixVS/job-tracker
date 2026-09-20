@@ -68,7 +68,12 @@ curl -X PATCH http://127.0.0.1:8000/api/v1/jobs/<job-uuid> \
 python -m app.cli upload-cv ~/Documents/cv.pdf   # set the active profile without running the server
 python -m app.cli sync                           # fetch → score → store, with a summary table
 python -m app.cli daily                          # today's top matches
+python -m app.cli daily -o reports/              # ...and save them to reports/jobs-YYYY-MM-DD.md
 ```
+
+`daily -o PATH` also writes the digest to a Markdown file: your profile, the last sync, a ranked table with links,
+and a section per job with a description excerpt and the job ID (for `PATCH /api/v1/jobs/{id}`). Pass a file name, or
+a directory to get a dated `jobs-YYYY-MM-DD.md`. `reports/` is git-ignored.
 
 `sync` exits with `0` on success or partial success, `1` on an error (e.g. no CV uploaded), and `2` when every
 source failed. That makes it safe to run from cron. If you schedule syncs externally, set
@@ -76,7 +81,7 @@ source failed. That makes it safe to run from cron. If you schedule syncs extern
 
 ```cron
 # crontab -e : every day at 07:00
-0 7 * * * cd /path/to/job-tracker && .venv/bin/python -m app.cli sync >> sync.log 2>&1
+0 7 * * * cd /path/to/job-tracker && .venv/bin/python -m app.cli sync >> sync.log 2>&1 && .venv/bin/python -m app.cli daily -o reports/ > /dev/null
 ```
 
 On Windows Task Scheduler, use program `C:\path\to\job-tracker\.venv\Scripts\python.exe`, arguments
@@ -94,9 +99,11 @@ On Windows Task Scheduler, use program `C:\path\to\job-tracker\.venv\Scripts\pyt
 | `REMOTE_ONLY` | `true` | Sent to the APIs as `remote_type=fully_remote` / `workplace_type=remote`. |
 | `FILTER_BY_SENIORITY` | `false` | Sends the CV's estimated seniority as a hard API filter. |
 | `FETCH_LOOKBACK_DAYS` | `2` | Only postings from this window are requested. |
-| `MAX_JOBS_PER_SOURCE` | `150` | Split across up to 3 role queries derived from the CV. |
-| `DETAIL_ENRICH_TOP_N` | `50` | Stage-2 detail calls per sync (see below). |
+| `MAX_JOBS_PER_SOURCE` | `1500` | Split across up to 3 role queries derived from the CV. |
+| `DETAIL_ENRICH_TOP_N` | `200` | Stage-2 detail calls per sync (see below). Only jobs with a fetched description can appear in the daily list. |
 | `HTTP_MAX_RETRIES` | `4` | Retries for 429, 5xx and network errors. |
+| `WORKLITTLE_MAX_JOBS` / `WORKLITTLE_DETAIL_TOP_N` | `300` / `5` | Worklittle-only caps per sync. Its free tier allows 1,000 jobs/month (300 per sync uses it up in about 3 syncs), and each detail call takes about 90s. |
+| `WORKLITTLE_TIMEOUT_SECONDS` / `WORKLITTLE_MAX_RETRIES` | `120` / `1` | Worklittle searches take about 30s, so the global `HTTP_TIMEOUT_SECONDS` is too short for it. |
 | `SCHEDULER_ENABLED` / `SYNC_INTERVAL_HOURS` / `SYNC_ON_STARTUP` | `true` / `24` / `false` | In-app APScheduler job. |
 
 ## How matching works
@@ -117,11 +124,12 @@ On Windows Task Scheduler, use program `C:\path\to\job-tracker\.venv\Scripts\pyt
    source fails, the others still run and the run is marked `partial`.
 3. **Two-stage scoring.** Neither API returns descriptions in search results. Every new job is first scored on
    title, company, skills, seniority and location. Only the best `DETAIL_ENRICH_TOP_N` get a detail call, and those
-   are re-scored on `title + description`. This keeps API usage bounded. Worklittle allows one request per second, so
-   50 detail calls take about 50 seconds.
+   are re-scored on `title + description`. This keeps API usage bounded. Worklittle has its own cap
+   (`WORKLITTLE_DETAIL_TOP_N`, default 5, fetched in parallel), because each of its detail calls takes about 90s.
 4. **Storage and dedup.** Every new job is stored, including those below the threshold, keyed by the unique
    `external_id = "<source>:<native id>"`. Later syncs therefore never re-score or re-insert a job, and "new" means
-   genuinely unseen. The daily query applies the threshold and the dismissed flag. Its 24h window reaches back to the
+   genuinely unseen. The daily query ranks only jobs scored on a fetched description, because
+   metadata-only scores run higher and aren't comparable, then applies the threshold and the dismissed flag. Its 24h window reaches back to the
    latest completed run, so a late scheduled run doesn't empty the digest.
 
 ## Tests
@@ -133,11 +141,15 @@ pytest -m slow      # also loads the real MiniLM model (downloads it on first ru
 
 ## Known limitations
 
-- **Vendor schemas aren't fully documented.** The JobDataLake detail response and Worklittle's job object don't list
-  their field names. The normalizers accept common variants (`description_text` / `description` /
-  `description_html`, ISO or unix timestamps, and so on), and the tests use payloads shaped like the published
-  examples. Run one real sync after adding a key. If a field comes back empty, adjust `normalize()` /
-  `fetch_details()` in `app/services/job_fetcher.py`.
+- **Vendor schemas aren't fully documented.** Search and detail responses from both APIs were checked against live
+  data on 2026-09-12, and the normalizers read them correctly. They still accept common field-name variants in case
+  an API changes. If a field starts coming back empty, adjust `normalize()` / `fetch_details()` in
+  `app/services/job_fetcher.py`.
+- **Worklittle is slow.** Measured on 2026-09-12 to 2026-09-14: about 30–65s per search and about 90s per job detail.
+  Its searches return at most 50 jobs per request, so the default 300 jobs take 6 sequential requests (roughly 3–7
+  minutes). Each sync uses up to `WORKLITTLE_MAX_JOBS` of the 1,000 free jobs per month; at 300 that's about 3 syncs.
+  Only `WORKLITTLE_DETAIL_TOP_N` (5) Worklittle jobs per sync get a description, so at most that many can reach the
+  daily list.
 - Worklittle seniority values other than `entry` are guesses, which is another reason `FILTER_BY_SENIORITY` defaults
   to off.
 - Scanned (image-only) CVs aren't supported, because there is no OCR.

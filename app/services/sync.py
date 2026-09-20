@@ -5,6 +5,7 @@ import logging
 import re
 import time
 import uuid
+from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime, timedelta
 
@@ -144,7 +145,8 @@ async def _run_sync(
 
         async with session_factory() as session:
             inserted = await _insert_jobs(session, final_jobs, scores)
-            matched = sum(1 for key in inserted if scores[key] >= settings.similarity_threshold)
+            described = {job.storage_key for job in final_jobs if job.description}
+            matched = sum(1 for key in inserted if key in described and scores[key] >= settings.similarity_threshold)
             status = "success" if all(s.startswith("ok") for s in source_status.values()) else (
                 "partial" if any_success else "failed"
             )
@@ -185,11 +187,10 @@ async def _run_sync(
 async def _fetch_all(
     sources: list[JobSource], queries: list[str], seniority: str | None, settings: Settings
 ) -> tuple[dict[str, RawJob], dict[str, str], bool]:
-    per_query_limit = max(1, settings.max_jobs_per_source // len(queries))
-
     async def search(source: JobSource, query: str) -> tuple[JobSource, list[RawJob], Exception | None]:
+        source_cap = source.max_jobs if source.max_jobs is not None else settings.max_jobs_per_source
         params = SearchParams(query=query, remote=settings.remote_only, seniority=seniority,
-                              lookback_days=settings.fetch_lookback_days, limit=per_query_limit)
+                              lookback_days=settings.fetch_lookback_days, limit=max(1, source_cap // len(queries)))
         try:
             return source, await source.search(params), None
         except Exception as exc:  # one failing source/query must not abort the others
@@ -235,7 +236,10 @@ async def _existing_keys(session: AsyncSession, keys: list[str]) -> set[str]:
 async def _score_two_stage(
     jobs: list[RawJob], sources: list[JobSource], matcher: Matcher, settings: Settings
 ) -> tuple[dict[str, float], list[RawJob], int]:
-    """Stage 1 scores search metadata for every job; stage 2 fetches descriptions for the best N and re-scores."""
+    """Stage 1 scores search metadata for every job; stage 2 fetches descriptions for the best N and re-scores.
+
+    N is DETAIL_ENRICH_TOP_N overall, and a source's `max_details` caps how many of those it serves.
+    """
     if not jobs:
         return {}, [], 0
     stage1 = await asyncio.to_thread(matcher.score_jobs, jobs, metadata_text)
@@ -243,8 +247,18 @@ async def _score_two_stage(
 
     sources_by_name = {source.name: source for source in sources}
     ranked = sorted(jobs, key=lambda job: scores[job.storage_key], reverse=True)
-    to_enrich = [job for job in ranked[: settings.detail_enrich_top_n]
-                 if not job.description and job.source in sources_by_name]
+    to_enrich: list[RawJob] = []
+    details_per_source: Counter[str] = Counter()
+    for job in ranked:
+        if len(to_enrich) >= settings.detail_enrich_top_n:
+            break
+        source = sources_by_name.get(job.source)
+        if job.description or source is None:
+            continue
+        if source.max_details is not None and details_per_source[job.source] >= source.max_details:
+            continue  # e.g. Worklittle, where one detail call takes ~90s
+        details_per_source[job.source] += 1
+        to_enrich.append(job)
 
     async def enrich(job: RawJob) -> RawJob:
         try:
@@ -309,6 +323,8 @@ async def _insert_jobs(session: AsyncSession, jobs: list[RawJob], scores: dict[s
 async def get_daily_jobs(session: AsyncSession, settings: Settings, now: datetime | None = None) -> list[Job]:
     """Top-N non-dismissed matches first seen in the last 24h cycle.
 
+    Only jobs scored on a fetched description are ranked: stage-1 metadata scores run higher and aren't comparable.
+
     The window reaches back to the latest completed run when it started more than 24h ago,
     so a late scheduler run never empties the digest.
     """
@@ -326,6 +342,7 @@ async def get_daily_jobs(session: AsyncSession, settings: Settings, now: datetim
         select(Job)
         .where(
             col(Job.is_dismissed).is_(False),
+            col(Job.has_description).is_(True),
             Job.relevance_score >= settings.similarity_threshold,
             Job.first_seen_at >= cutoff,
         )
@@ -333,3 +350,7 @@ async def get_daily_jobs(session: AsyncSession, settings: Settings, now: datetim
         .limit(settings.daily_target_count)
     )
     return list((await session.exec(statement)).all())
+
+
+async def get_latest_run(session: AsyncSession) -> DailyRun | None:
+    return (await session.exec(select(DailyRun).order_by(col(DailyRun.started_at).desc()).limit(1))).first()

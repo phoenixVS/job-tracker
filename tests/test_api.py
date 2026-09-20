@@ -73,7 +73,7 @@ def test_upload_sync_daily_and_triage_flow(client, make_pdf, settings):
     assert first["status"] == "success"
     assert first["fetched"] == first["new"] == MOCK_REMOTE_JOBS  # duplicates across role queries collapsed
     assert first["enriched"] == settings.detail_enrich_top_n
-    assert 0 < first["matched"] <= first["new"]
+    assert 0 < first["matched"] <= first["enriched"] <= first["new"]  # only described jobs can match
     assert first["sources"] == {"mock": f"ok ({MOCK_REMOTE_JOBS} jobs)"}
 
     daily = client.get("/api/v1/jobs/daily").json()
@@ -124,12 +124,14 @@ async def test_daily_window_reaches_back_to_latest_run(settings):
         session.add(DailyRun(started_at=now - timedelta(hours=30), status="success"))
         session.add_all([
             Job(external_id="mock:in-window", source="mock", title="A", relevance_score=0.9,
-                first_seen_at=now - timedelta(hours=29)),
+                first_seen_at=now - timedelta(hours=29), has_description=True),
             Job(external_id="mock:too-old", source="mock", title="B", relevance_score=0.8,
-                first_seen_at=now - timedelta(hours=40)),
-            Job(external_id="mock:low-score", source="mock", title="C", relevance_score=0.01, first_seen_at=now),
+                first_seen_at=now - timedelta(hours=40), has_description=True),
+            Job(external_id="mock:low-score", source="mock", title="C", relevance_score=0.01, first_seen_at=now,
+                has_description=True),
             Job(external_id="mock:dismissed", source="mock", title="D", relevance_score=0.95, first_seen_at=now,
-                is_dismissed=True),
+                is_dismissed=True, has_description=True),
+            Job(external_id="mock:no-description", source="mock", title="E", relevance_score=0.99, first_seen_at=now),
         ])
         await session.commit()
         titles = [job.title for job in await get_daily_jobs(session, settings, now=now)]

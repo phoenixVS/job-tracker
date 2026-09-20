@@ -48,6 +48,8 @@ class SearchParams:
 
 class JobSource(Protocol):
     name: str
+    max_jobs: int | None  # per-sync job cap; None -> MAX_JOBS_PER_SOURCE
+    max_details: int | None  # per-sync detail-call cap; None -> only DETAIL_ENRICH_TOP_N applies
 
     async def search(self, params: SearchParams) -> list[RawJob]: ...
 
@@ -190,8 +192,12 @@ class _HttpSource:
         timeout: float = 30.0,
         transport: httpx.AsyncBaseTransport | None = None,
         sleep=asyncio.sleep,
+        max_jobs: int | None = None,
+        max_details: int | None = None,
     ) -> None:
         self._client = httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout, transport=transport)
+        self.max_jobs = max_jobs
+        self.max_details = max_details
         self._throttle = throttle
         self._max_retries = max_retries
         self._sleep = sleep  # injectable so tests don't actually wait
@@ -303,6 +309,19 @@ class JobDataLakeClient(_HttpSource):
 _WORKLITTLE_SENIORITY = {"junior": "entry", "mid": "mid", "senior": "senior", "staff": "staff"}
 
 
+def _worklittle_location(item: dict[str, Any]) -> str:
+    """Prefer the `locations` list; some postings leave it empty and only fill job_city/job_state/job_country."""
+    listed = _location(_first(item, "location", "locations", "location_name"))
+    if listed:
+        return listed
+    parts: list[str] = []
+    for key in ("job_city", "job_state", "job_country"):
+        value = item.get(key)
+        if value and not any(str(value) in part for part in parts):
+            parts.append(str(value))
+    return ", ".join(parts)
+
+
 class WorklittleClient(_HttpSource):
     """GET /jobs (cursor, max 50) and GET /jobs/{id}. Auth: Bearer. 60 req/min; QUOTA_EXCEEDED is final."""
 
@@ -311,7 +330,8 @@ class WorklittleClient(_HttpSource):
 
     def __init__(self, api_key: str, base_url: str = "https://api.worklittle.com", **kwargs: Any) -> None:
         headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
-        super().__init__(base_url, headers, _Throttle(max_concurrency=1, min_interval=1.0), **kwargs)
+        # Starts stay >=1s apart (60 req/min), but requests may overlap: a search takes ~30s and a detail call ~90s.
+        super().__init__(base_url, headers, _Throttle(max_concurrency=5, min_interval=1.0), **kwargs)
 
     def _is_retryable(self, response: httpx.Response) -> bool:
         if response.status_code == 429 and _error_code(response) == "QUOTA_EXCEEDED":
@@ -358,7 +378,7 @@ class WorklittleClient(_HttpSource):
             source="worklittle",
             title=str(title).strip(),
             company=_company_name(_first(item, "company", "company_name", "organization")),
-            location=_location(_first(item, "location", "locations", "location_name")),
+            location=_worklittle_location(item),
             is_remote="remote" in workplace or item.get("remote") is True,
             description=_description(item),
             url=str(_first(item, "apply_url", "url", "job_url") or ""),
@@ -375,6 +395,8 @@ class MockJobSource:
     """Bundled postings for keyless/offline use. Search omits descriptions, like the real feeds."""
 
     name = "mock"
+    max_jobs: int | None = None
+    max_details: int | None = None
 
     def __init__(self, path: Path = MOCK_DATA_PATH) -> None:
         self._items: list[dict[str, Any]] = json.loads(path.read_text(encoding="utf-8"))
@@ -415,7 +437,15 @@ def build_sources(settings: Settings, transport: httpx.AsyncBaseTransport | None
     if settings.jobdatalake_api_key:
         sources.append(JobDataLakeClient(settings.jobdatalake_api_key, settings.jobdatalake_base_url, **common))
     if settings.worklittle_api_key:
-        sources.append(WorklittleClient(settings.worklittle_api_key, settings.worklittle_base_url, **common))
+        sources.append(WorklittleClient(
+            settings.worklittle_api_key,
+            settings.worklittle_base_url,
+            max_retries=settings.worklittle_max_retries,
+            timeout=settings.worklittle_timeout_seconds,
+            transport=transport,
+            max_jobs=settings.worklittle_max_jobs,
+            max_details=settings.worklittle_detail_top_n,
+        ))
     if not sources:
         logger.warning("No JOBDATALAKE_API_KEY / WORKLITTLE_API_KEY configured; using bundled mock job data")
         sources.append(MockJobSource())

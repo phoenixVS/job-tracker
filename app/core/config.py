@@ -28,10 +28,16 @@ class Settings(BaseSettings):
     # Off by default: a wrong CV seniority guess would silently drop results at the API.
     filter_by_seniority: bool = False
     fetch_lookback_days: int = Field(default=2, ge=0)
-    max_jobs_per_source: int = Field(default=150, ge=1)
-    detail_enrich_top_n: int = Field(default=50, ge=0)
+    max_jobs_per_source: int = Field(default=1500, ge=1)
+    detail_enrich_top_n: int = Field(default=200, ge=0)
     http_max_retries: int = Field(default=4, ge=0)
     http_timeout_seconds: float = Field(default=30.0, gt=0)
+
+    # Worklittle-only limits: its API is slow (search ~30s, detail ~90s) and the free tier allows 1,000 jobs/month.
+    worklittle_max_jobs: int = Field(default=300, ge=1)
+    worklittle_detail_top_n: int = Field(default=5, ge=0)
+    worklittle_timeout_seconds: float = Field(default=120.0, gt=0)
+    worklittle_max_retries: int = Field(default=1, ge=0)
 
     # CV upload
     max_cv_bytes: int = 10 * 1024 * 1024

@@ -127,6 +127,13 @@ async def test_worklittle_cursor_pagination_auth_and_closed_jobs():
     assert jobs[0].published_at == datetime(2026, 9, 10, 8, 30, tzinfo=timezone.utc)
 
 
+def test_worklittle_location_falls_back_to_job_address_fields():
+    item = worklittle_job("wl-7") | {"location": None, "locations": [], "job_city": "Hanover, MD", "job_state": "MD",
+                                     "job_country": "US"}
+
+    assert WorklittleClient.normalize(item).location == "Hanover, MD, US"
+
+
 async def test_worklittle_details_use_description_text():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"data": {"id": "wl-1", "description_text": "Keep  the\nplatform up."}})
@@ -247,6 +254,20 @@ async def test_build_sources_uses_mock_only_without_keys():
     sources = build_sources(with_key)
     assert [type(source) for source in sources] == [JobDataLakeClient]
     await sources[0].aclose()
+
+
+async def test_build_sources_gives_worklittle_its_own_limits():
+    settings = Settings(_env_file=None, jobdatalake_api_key="jdl", worklittle_api_key="wl",
+                        http_timeout_seconds=30, http_max_retries=4)
+    jobdatalake, worklittle = build_sources(settings)
+    try:
+        assert (jobdatalake.max_jobs, jobdatalake.max_details, jobdatalake._max_retries) == (None, None, 4)
+        assert jobdatalake._client.timeout.read == 30
+        assert (worklittle.max_jobs, worklittle.max_details, worklittle._max_retries) == (300, 5, 1)
+        assert worklittle._client.timeout.read == 120
+    finally:
+        await jobdatalake.aclose()
+        await worklittle.aclose()
 
 
 async def test_mock_source_behaves_like_real_feeds():
