@@ -9,6 +9,7 @@ from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime, timedelta
 
+import numpy as np
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlmodel import col, select
@@ -55,14 +56,18 @@ async def save_profile(
     record.seniority = profile.seniority
     record.years_experience = profile.years_experience
     record.summary_blob = profile.summary_blob
-    record.embedding = vector_to_bytes(vector)
-    record.embedding_model = matcher.model_name
     record.source_filename = source_filename
+    _store_embedding(record, matcher, vector)
     record.updated_at = utcnow()
     session.add(record)
     await session.commit()
     await session.refresh(record)
     return record
+
+
+def _store_embedding(record: CandidateProfileRecord, matcher: Matcher, vector: np.ndarray) -> None:
+    record.embedding = vector_to_bytes(vector)
+    record.embedding_model = matcher.model_name
 
 
 async def _load_profile_vector(session: AsyncSession, matcher: Matcher, record: CandidateProfileRecord) -> None:
@@ -71,8 +76,7 @@ async def _load_profile_vector(session: AsyncSession, matcher: Matcher, record: 
         return
     # The embedding model changed since upload: re-encode the stored summary and persist it.
     vector = await asyncio.to_thread(matcher.set_profile, record.summary_blob)
-    record.embedding = vector_to_bytes(vector)
-    record.embedding_model = matcher.model_name
+    _store_embedding(record, matcher, vector)
     session.add(record)
     await session.commit()
 
@@ -121,19 +125,7 @@ async def _run_sync(
     sources: list[JobSource],
 ) -> SyncResult:
     started = time.monotonic()
-    async with session_factory() as session:
-        record = await get_active_profile(session)
-        if record is None:
-            raise NoProfileError("No CV uploaded yet: POST /api/v1/cv/upload first")
-        await _load_profile_vector(session, matcher, record)
-        run = DailyRun()
-        session.add(run)
-        await session.commit()
-        run_id = run.id
-        queries = build_queries(record.roles)
-        seniority = record.seniority if settings.filter_by_seniority else None
-    assert run_id is not None
-
+    run_id, queries, seniority = await _start_run(session_factory, matcher, settings)
     try:
         batch, source_status, any_success = await _fetch_all(sources, queries, seniority, settings)
 
@@ -145,29 +137,22 @@ async def _run_sync(
 
         async with session_factory() as session:
             inserted = await _insert_jobs(session, final_jobs, scores)
-            described = {job.storage_key for job in final_jobs if job.description}
-            matched = sum(1 for key in inserted if key in described and scores[key] >= settings.similarity_threshold)
-            status = "success" if all(s.startswith("ok") for s in source_status.values()) else (
-                "partial" if any_success else "failed"
-            )
-            run = await session.get(DailyRun, run_id)
-            assert run is not None
-            run.status = status
-            run.finished_at = utcnow()
-            run.jobs_fetched = len(batch)
-            run.jobs_new = len(inserted)
-            run.jobs_matched_count = matched
-            if status != "success":
-                run.error = "; ".join(f"{name}: {s}" for name, s in source_status.items() if not s.startswith("ok"))
-            session.add(run)
-            await session.commit()
+        described = {job.storage_key for job in final_jobs if job.description}
+        matched = sum(1 for key in inserted if key in described and scores[key] >= settings.similarity_threshold)
+
+        status = _run_status(source_status, any_success)
+        failures = [f"{name}: {s}" for name, s in source_status.items() if not s.startswith("ok")]
+        await _update_run(
+            session_factory,
+            run_id,
+            status=status,
+            jobs_fetched=len(batch),
+            jobs_new=len(inserted),
+            jobs_matched_count=matched,
+            error="; ".join(failures) if status != "success" else None,
+        )
     except Exception as exc:
-        async with session_factory() as session:
-            run = await session.get(DailyRun, run_id)
-            if run is not None:
-                run.status, run.finished_at, run.error = "failed", utcnow(), repr(exc)
-                session.add(run)
-                await session.commit()
+        await _update_run(session_factory, run_id, status="failed", error=repr(exc))
         raise
 
     result = SyncResult(
@@ -182,6 +167,42 @@ async def _run_sync(
     )
     logger.info("Sync finished: %s", result.model_dump())
     return result
+
+
+async def _start_run(
+    session_factory: async_sessionmaker[AsyncSession], matcher: Matcher, settings: Settings
+) -> tuple[int, list[str], str | None]:
+    """Load the profile into the matcher and open a DailyRun. Returns (run id, search queries, seniority filter)."""
+    async with session_factory() as session:
+        record = await get_active_profile(session)
+        if record is None:
+            raise NoProfileError("No CV uploaded yet: POST /api/v1/cv/upload first")
+        await _load_profile_vector(session, matcher, record)
+        run = DailyRun()
+        session.add(run)
+        await session.commit()
+        assert run.id is not None
+        seniority = record.seniority if settings.filter_by_seniority else None
+        return run.id, build_queries(record.roles), seniority
+
+
+async def _update_run(session_factory: async_sessionmaker[AsyncSession], run_id: int, **fields: object) -> None:
+    """Close the DailyRun with the given column values."""
+    async with session_factory() as session:
+        run = await session.get(DailyRun, run_id)
+        if run is None:
+            return
+        run.finished_at = utcnow()
+        for name, value in fields.items():
+            setattr(run, name, value)
+        session.add(run)
+        await session.commit()
+
+
+def _run_status(source_status: dict[str, str], any_success: bool) -> str:
+    if all(s.startswith("ok") for s in source_status.values()):
+        return "success"
+    return "partial" if any_success else "failed"
 
 
 async def _fetch_all(
@@ -233,6 +254,25 @@ async def _existing_keys(session: AsyncSession, keys: list[str]) -> set[str]:
     return existing
 
 
+def _select_for_enrichment(
+    jobs: list[RawJob], scores: dict[str, float], sources_by_name: dict[str, JobSource], limit: int
+) -> list[RawJob]:
+    """The best-scoring description-less jobs, at most `limit` overall and `max_details` per source."""
+    selected: list[RawJob] = []
+    details_per_source: Counter[str] = Counter()
+    for job in sorted(jobs, key=lambda job: scores[job.storage_key], reverse=True):
+        if len(selected) >= limit:
+            break
+        source = sources_by_name.get(job.source)
+        if job.description or source is None:
+            continue
+        if source.max_details is not None and details_per_source[job.source] >= source.max_details:
+            continue  # e.g. Worklittle, where one detail call takes ~90s
+        details_per_source[job.source] += 1
+        selected.append(job)
+    return selected
+
+
 async def _score_two_stage(
     jobs: list[RawJob], sources: list[JobSource], matcher: Matcher, settings: Settings
 ) -> tuple[dict[str, float], list[RawJob], int]:
@@ -246,19 +286,7 @@ async def _score_two_stage(
     scores = {job.storage_key: score for job, score in zip(jobs, stage1)}
 
     sources_by_name = {source.name: source for source in sources}
-    ranked = sorted(jobs, key=lambda job: scores[job.storage_key], reverse=True)
-    to_enrich: list[RawJob] = []
-    details_per_source: Counter[str] = Counter()
-    for job in ranked:
-        if len(to_enrich) >= settings.detail_enrich_top_n:
-            break
-        source = sources_by_name.get(job.source)
-        if job.description or source is None:
-            continue
-        if source.max_details is not None and details_per_source[job.source] >= source.max_details:
-            continue  # e.g. Worklittle, where one detail call takes ~90s
-        details_per_source[job.source] += 1
-        to_enrich.append(job)
+    to_enrich = _select_for_enrichment(jobs, scores, sources_by_name, settings.detail_enrich_top_n)
 
     async def enrich(job: RawJob) -> RawJob:
         try:

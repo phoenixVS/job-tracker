@@ -45,6 +45,11 @@ class SearchParams:
     lookback_days: int = 2
     limit: int = 100
 
+    @property
+    def text(self) -> str:
+        """Free-text query: the search phrase plus tags."""
+        return " ".join([self.query, *self.tags]).strip()
+
 
 class JobSource(Protocol):
     name: str
@@ -155,6 +160,10 @@ def _retry_after_seconds(header: str | None) -> float | None:
     return min(max(seconds, 0.0), MAX_RETRY_AFTER_SECONDS)
 
 
+def _backoff_delay(attempt: int) -> float:
+    return min(MAX_BACKOFF_SECONDS, 2.0**attempt) + random.uniform(0, 0.5)
+
+
 # --------------------------------------------------------------------------- HTTP base
 
 
@@ -217,16 +226,14 @@ class _HttpSource:
             except httpx.TransportError as exc:
                 if attempt >= self._max_retries:
                     raise SourceError(self.name, f"network error: {exc!r}") from exc
-                delay = min(MAX_BACKOFF_SECONDS, 2.0**attempt) + random.uniform(0, 0.5)
+                delay = _backoff_delay(attempt)
             else:
                 if response.status_code < 400:
                     return response.json()
                 if attempt >= self._max_retries or not self._is_retryable(response):
                     raise SourceError(self.name, _error_message(response), response.status_code)
                 retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
-                delay = retry_after if retry_after is not None else (
-                    min(MAX_BACKOFF_SECONDS, 2.0**attempt) + random.uniform(0, 0.5)
-                )
+                delay = retry_after if retry_after is not None else _backoff_delay(attempt)
             attempt += 1
             logger.warning("%s: retrying GET %s in %.1fs (retry %d/%d)", self.name, path, delay, attempt,
                            self._max_retries)
@@ -249,7 +256,7 @@ class JobDataLakeClient(_HttpSource):
         super().__init__(base_url, headers, _Throttle(max_concurrency=4, min_interval=0.125), **kwargs)
 
     async def search(self, params: SearchParams) -> list[RawJob]:
-        query = " ".join([params.query, *params.tags]).strip() or "*"
+        query = params.text or "*"
         posted_after = None
         if params.lookback_days:
             posted_after = int((datetime.now(timezone.utc) - timedelta(days=params.lookback_days)).timestamp() * 1000)
@@ -339,7 +346,7 @@ class WorklittleClient(_HttpSource):
         return super()._is_retryable(response)
 
     async def search(self, params: SearchParams) -> list[RawJob]:
-        query = " ".join([params.query, *params.tags]).strip()
+        query = params.text
         jobs: list[RawJob] = []
         cursor: str | None = None
         while len(jobs) < params.limit:
