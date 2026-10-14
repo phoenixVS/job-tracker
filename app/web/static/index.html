@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Job Matches</title>
+  <link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+  <header class="top">
+    <div class="wrap top-row">
+      <div>
+        <h1>Job matches</h1>
+        <p id="profile" class="muted">Loading…</p>
+      </div>
+      <div class="actions">
+        <label class="btn" id="upload-label">
+          Upload CV
+          <input id="cv-input" type="file" accept="application/pdf" hidden>
+        </label>
+        <button id="sync-btn" class="btn primary" type="button">Sync now</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <div id="notice" class="notice" role="status" hidden></div>
+    <section id="sync-result" class="panel" hidden></section>
+
+    <form id="filters" class="filters" autocomplete="off">
+      <div class="seg" role="group" aria-label="Window">
+        <button type="button" data-window="daily">Today</button>
+        <button type="button" data-window="all">All matches</button>
+      </div>
+      <label>Source
+        <select name="source"><option value="">Any</option></select>
+      </label>
+      <label>Location
+        <select name="remote">
+          <option value="">Any</option>
+          <option value="true">Remote</option>
+          <option value="false">On-site</option>
+        </select>
+      </label>
+      <label>Min score <output id="min-score-out">default</output>
+        <input name="min_score" type="range" min="0" max="1" step="0.05" value="0">
+      </label>
+      <label>Sort
+        <select name="sort">
+          <option value="score">Best match</option>
+          <option value="newest">Newest found</option>
+          <option value="published">Recently posted</option>
+        </select>
+      </label>
+      <label class="check"><input name="bookmarked" type="checkbox"> Bookmarked only</label>
+    </form>
+
+    <p id="summary" class="muted"></p>
+    <ol id="jobs" class="jobs"></ol>
+
+    <nav id="pager" class="pager" hidden>
+      <button id="prev" type="button" class="btn">Previous</button>
+      <span id="range" class="muted"></span>
+      <button id="next" type="button" class="btn">Next</button>
+    </nav>
+
+    <p id="footnote" class="muted small"></p>
+  </main>
+
+  <script type="module" src="/static/js/app.js"></script>
+</body>
+</html>

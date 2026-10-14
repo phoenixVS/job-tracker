@@ -10,6 +10,7 @@ from app.core.config import Settings, get_settings
 from app.core.database import configure_engine, dispose_engine, init_db
 from app.services.matcher import get_matcher
 from app.services.scheduler import create_scheduler
+from app.web.router import mount_web
 
 logger = logging.getLogger("app")
 
@@ -40,6 +41,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Job Matcher", version="0.1.0", lifespan=lifespan)
     app.dependency_overrides[get_settings] = lambda: settings
     app.include_router(api_router)
+    mount_web(app)
 
     @app.get("/health", tags=["meta"])
     async def health() -> dict[str, str]:

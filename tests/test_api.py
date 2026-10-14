@@ -11,8 +11,8 @@ from app.core.database import configure_engine, dispose_engine, get_sessionmaker
 from app.main import create_app
 from app.models.common import utcnow
 from app.models.job import DailyRun, Job
+from app.services.job_queries import get_daily_jobs
 from app.services.matcher import Matcher, set_matcher
-from app.services.sync import get_daily_jobs
 
 CV_LINES = [
     "Alex Rivera",
@@ -138,3 +138,88 @@ async def test_daily_window_reaches_back_to_latest_run(settings):
     await dispose_engine()
 
     assert titles == ["A"]
+
+
+def _synced(client, make_pdf):
+    upload_cv(client, make_pdf(CV_LINES))
+    assert client.post("/api/v1/jobs/sync").status_code == 200
+
+
+def test_status_before_and_after_sync(client, make_pdf, settings):
+    before = client.get("/api/v1/jobs/status").json()
+    assert (before["profile"], before["last_run"], before["sync_in_progress"]) == (None, None, False)
+    assert before["sources"] == []
+
+    _synced(client, make_pdf)
+    after = client.get("/api/v1/jobs/status").json()
+    assert after["profile"]["roles"][0] == "Senior Backend Engineer"
+    assert after["last_run"]["status"] == "success"
+    assert after["sources"] == ["mock"]
+    assert after["similarity_threshold"] == settings.similarity_threshold
+
+
+def test_list_jobs_daily_and_all_with_paging(client, make_pdf, settings):
+    _synced(client, make_pdf)
+
+    daily = client.get("/api/v1/jobs").json()
+    assert daily["window"] == "daily"
+    assert 0 < len(daily["items"]) <= daily["total"] <= settings.daily_target_count
+    assert "description" not in daily["items"][0] and "snippet" in daily["items"][0]
+
+    everything = client.get("/api/v1/jobs", params={"window": "all", "limit": 100}).json()
+    scores = [job["relevance_score"] for job in everything["items"]]
+    assert scores == sorted(scores, reverse=True)
+    assert everything["total"] == len(everything["items"]) >= daily["total"]
+
+    first = client.get("/api/v1/jobs", params={"window": "all", "limit": 2}).json()
+    second = client.get("/api/v1/jobs", params={"window": "all", "limit": 2, "offset": 2}).json()
+    ids = [job["id"] for job in first["items"] + second["items"]]
+    assert ids == [job["id"] for job in everything["items"][:4]]
+    assert first["total"] == everything["total"]
+
+
+def test_list_jobs_filters(client, make_pdf):
+    _synced(client, make_pdf)
+    url = "/api/v1/jobs"
+    base = {"window": "all", "limit": 100}
+
+    assert client.get(url, params={**base, "source": "nope"}).json()["items"] == []
+    assert client.get(url, params={**base, "source": "mock"}).json()["total"] > 0
+    assert client.get(url, params={**base, "remote": False}).json()["items"] == []  # mock jobs are all remote
+    assert client.get(url, params={**base, "min_score": 1}).json()["items"] == []
+    for sort in ("newest", "published"):
+        assert client.get(url, params={**base, "sort": sort}).status_code == 200
+
+    target = client.get(url, params=base).json()["items"][0]["id"]
+    client.patch(f"{url}/{target}", json={"is_bookmarked": True})
+    saved = client.get(url, params={**base, "bookmarked": True}).json()["items"]
+    assert [job["id"] for job in saved] == [target]
+
+    total = client.get(url, params=base).json()["total"]
+    client.patch(f"{url}/{target}", json={"is_dismissed": True})
+    assert client.get(url, params=base).json()["total"] == total - 1
+    assert client.get(url, params={**base, "include_dismissed": True}).json()["total"] == total
+
+
+@pytest.mark.parametrize("params", [
+    {"limit": 0}, {"limit": 101}, {"offset": -1}, {"min_score": 2}, {"sort": "bogus"}, {"window": "bogus"},
+])
+def test_list_jobs_validation(client, params):
+    assert client.get("/api/v1/jobs", params=params).status_code == 422
+
+
+def test_get_job_by_id(client, make_pdf):
+    _synced(client, make_pdf)
+    item = client.get("/api/v1/jobs", params={"window": "all", "limit": 1}).json()["items"][0]
+
+    job = client.get(f"/api/v1/jobs/{item['id']}")
+    assert job.status_code == 200 and job.json()["description"]
+    assert client.get(f"/api/v1/jobs/{uuid.uuid4()}").status_code == 404
+
+
+def test_web_ui_is_served(client):
+    index = client.get("/")
+    assert index.status_code == 200 and index.headers["content-type"].startswith("text/html")
+    assert "<title>Job Matches</title>" in index.text
+    assert client.get("/static/js/app.js").status_code == 200
+    assert client.get("/static/css/app.css").status_code == 200

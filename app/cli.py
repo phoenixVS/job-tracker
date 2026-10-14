@@ -18,17 +18,10 @@ from app.models.common import utcnow
 from app.models.cv import CandidateProfileRecord
 from app.models.job import DailyRun, Job
 from app.services.cv_parser import CVParseError, build_profile
+from app.services.job_queries import get_daily_jobs, get_latest_run
 from app.services.matcher import get_matcher
 from app.services.report import render_daily_report
-from app.services.sync import (
-    NoProfileError,
-    SyncInProgressError,
-    get_active_profile,
-    get_daily_jobs,
-    get_latest_run,
-    run_sync,
-    save_profile,
-)
+from app.services.sync import NoProfileError, SyncInProgressError, get_active_profile, run_sync, save_profile
 
 console = Console()
 

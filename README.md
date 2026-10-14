@@ -36,7 +36,9 @@ cp .env.example .env        # optional: add API keys, tune thresholds
 uvicorn app.main:app --reload
 ```
 
-Interactive docs are served at http://127.0.0.1:8000/docs.
+The web UI is at http://127.0.0.1:8000/ (ranked matches with filters, paging, bookmark/dismiss, CV upload and sync).
+It has no authentication, like the API: only bind it to localhost.
+Interactive API docs are at http://127.0.0.1:8000/docs.
 
 ```bash
 # 1. Upload your CV (parsed, embedded, stored; later syncs reuse it)
@@ -59,6 +61,9 @@ curl -X PATCH http://127.0.0.1:8000/api/v1/jobs/<job-uuid> \
 | `GET` | `/api/v1/cv/profile` | The stored active profile (`404` before the first upload). |
 | `POST` | `/api/v1/jobs/sync` | Runs the pipeline and returns `{status, fetched, new, matched, enriched, sources, …}`. Returns `409` if no CV has been uploaded or a sync is already running. |
 | `GET` | `/api/v1/jobs/daily` | Top `DAILY_TARGET_COUNT` non-dismissed jobs with `relevance_score ≥ SIMILARITY_THRESHOLD` from the current 24h cycle. |
+| `GET` | `/api/v1/jobs` | Paged matches for the web UI. Query: `window=daily\|all`, `source` (repeatable), `remote`, `min_score`, `bookmarked`, `include_dismissed`, `sort=score\|newest\|published`, `limit` (≤100), `offset`. Items carry a `snippet` instead of the description. |
+| `GET` | `/api/v1/jobs/status` | Profile, last sync run, whether a sync is running, threshold and known sources. |
+| `GET` | `/api/v1/jobs/{job_id}` | One job with its full description. |
 | `PATCH` | `/api/v1/jobs/{job_id}` | `{"is_dismissed": bool, "is_bookmarked": bool}` (either or both). |
 | `GET` | `/health` | Liveness check. |
 
@@ -170,8 +175,9 @@ app/
   core/           config.py (pydantic-settings), database.py (async SQLModel/aiosqlite)
   models/         cv.py (CandidateProfile + stored record), job.py (Job, DailyRun, RawJob, schemas)
   services/       cv_parser.py, skills_taxonomy.py, matcher.py, job_fetcher.py, mock_jobs.json,
-                  sync.py (pipeline + daily query), scheduler.py (APScheduler)
+                  sync.py (pipeline), job_queries.py (daily/all match queries), scheduler.py (APScheduler)
+  web/            router.py + static/ (index.html, css/app.css, js/{app,api}.js): no build step
   cli.py          python -m app.cli {sync,daily,upload-cv}
   main.py         app factory + lifespan (DB init, model warm-up, scheduler)
-tests/            test_cv_parser.py, test_matcher.py, test_job_fetcher.py, test_api.py
+tests/            test_cv_parser.py, test_matcher.py, test_job_fetcher.py, test_api.py, test_job_queries.py
 ```

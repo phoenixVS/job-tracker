@@ -1,4 +1,4 @@
-"""The fetch -> score -> store pipeline and digest queries, shared by the API, CLI and scheduler."""
+"""The fetch -> score -> store pipeline, shared by the API, CLI and scheduler."""
 
 import asyncio
 import logging
@@ -7,7 +7,6 @@ import time
 import uuid
 from collections import Counter
 from collections.abc import Sequence
-from datetime import datetime, timedelta
 
 import numpy as np
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -343,42 +342,3 @@ async def _insert_jobs(session: AsyncSession, jobs: list[RawJob], scores: dict[s
         inserted.extend(result.scalars().all())
     await session.commit()
     return inserted
-
-
-# --------------------------------------------------------------------------- queries
-
-
-async def get_daily_jobs(session: AsyncSession, settings: Settings, now: datetime | None = None) -> list[Job]:
-    """Top-N non-dismissed matches first seen in the last 24h cycle.
-
-    Only jobs scored on a fetched description are ranked: stage-1 metadata scores run higher and aren't comparable.
-
-    The window reaches back to the latest completed run when it started more than 24h ago,
-    so a late scheduler run never empties the digest.
-    """
-    now = now or utcnow()
-    cutoff = now - timedelta(hours=24)
-    latest_start = (await session.exec(
-        select(DailyRun.started_at)
-        .where(DailyRun.status != "failed")
-        .order_by(col(DailyRun.started_at).desc())
-        .limit(1)
-    )).first()
-    if latest_start is not None and latest_start < cutoff:
-        cutoff = latest_start
-    statement = (
-        select(Job)
-        .where(
-            col(Job.is_dismissed).is_(False),
-            col(Job.has_description).is_(True),
-            Job.relevance_score >= settings.similarity_threshold,
-            Job.first_seen_at >= cutoff,
-        )
-        .order_by(col(Job.relevance_score).desc(), col(Job.first_seen_at).desc())
-        .limit(settings.daily_target_count)
-    )
-    return list((await session.exec(statement)).all())
-
-
-async def get_latest_run(session: AsyncSession) -> DailyRun | None:
-    return (await session.exec(select(DailyRun).order_by(col(DailyRun.started_at).desc()).limit(1))).first()

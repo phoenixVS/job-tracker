@@ -7,6 +7,7 @@ from sqlalchemy import Text
 from sqlmodel import Field, SQLModel
 
 from app.models.common import UTCDateTime, utcnow
+from app.models.cv import ProfileRead
 
 SourceName = Literal["jobdatalake", "worklittle", "mock"]
 
@@ -81,6 +82,58 @@ class JobRead(SQLModel):
     first_seen_at: datetime
     is_dismissed: bool
     is_bookmarked: bool
+
+
+class JobListItem(SQLModel):
+    """A `JobRead` without the full description, for list views."""
+
+    id: uuid.UUID
+    source: str
+    title: str
+    company: str
+    location: str
+    is_remote: bool
+    url: str
+    snippet: str
+    published_at: datetime | None
+    relevance_score: float
+    first_seen_at: datetime
+    is_dismissed: bool
+    is_bookmarked: bool
+
+    @classmethod
+    def from_job(cls, job: Job, snippet_chars: int = 280) -> "JobListItem":
+        text = " ".join(job.description.split())
+        snippet = text if len(text) <= snippet_chars else text[:snippet_chars].rstrip() + "…"
+        return cls(**job.model_dump(exclude={"description", "external_id", "has_description"}), snippet=snippet)
+
+
+class JobPageRead(SQLModel):
+    items: list[JobListItem]
+    total: int
+    limit: int
+    offset: int
+    window: Literal["daily", "all"]
+
+
+class RunRead(SQLModel):
+    id: int
+    started_at: datetime
+    finished_at: datetime | None
+    status: str
+    jobs_fetched: int
+    jobs_new: int
+    jobs_matched_count: int
+    error: str | None
+
+
+class StatusRead(SQLModel):
+    profile: ProfileRead | None
+    last_run: RunRead | None
+    sync_in_progress: bool
+    similarity_threshold: float
+    daily_target_count: int
+    sources: list[str]  # distinct sources with stored jobs
 
 
 class JobUpdate(SQLModel):
